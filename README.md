@@ -32,7 +32,7 @@ A terminal-based SSH connection manager with bookmarks, auto-negotiation for leg
 ### Quick Install
 
 ```bash
-git clone https://github.com/youruser/sshb.git
+git clone https://github.com/jahedcuet/sshb.git
 cd sshb
 sudo ./install.sh
 ```
