@@ -1,0 +1,857 @@
+#!/usr/bin/env bash
+#
+# sshb - SSH bookmark manager: fzf picker + CLI add/edit/delete,
+#        GPG-encrypted passwords protected by a single master password.
+#        Auto-detects legacy SSH crypto algorithms and delegates to ssh6.
+#
+# Requires: fzf, gpg, sshpass (for pass auth), base64, curl/git (for ssh6 auto-install)
+
+set -euo pipefail
+
+CONF_DIR="${SSHB_DIR:-$HOME/.sshb}"
+CONF_FILE="${SSHB_CONF:-$CONF_DIR/bookmarks.conf}"
+VERIFIER_FILE="$CONF_DIR/.verifier"
+SSH6_CONF="$CONF_DIR/ssh6_config"
+
+mkdir -p "$CONF_DIR"
+chmod 700 "$CONF_DIR"
+touch "$CONF_FILE"
+chmod 600 "$CONF_FILE"
+
+MASTER_PASS=""
+UI="whiptail"   # falls back to dialog if whiptail isn't present
+CACHE_FILE="/dev/shm/sshb_master_$USER"
+CACHE_TTL=28800  # 8 hours
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
+
+# ---------- Auto-installer Helpers ----------
+
+ensure_ssh6() {
+  if ! command -v ssh6 >/dev/null 2>&1; then
+    echo "Installing ssh6 installer from https://github.com/jahedcuet/ssh6-installer..."
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    if command -v git >/dev/null 2>&1; then
+      git clone https://github.com/jahedcuet/ssh6-installer "$tmp_dir/ssh6-installer"
+    elif command -v curl >/dev/null 2>&1; then
+      mkdir -p "$tmp_dir/ssh6-installer"
+      curl -sSL https://github.com/jahedcuet/ssh6-installer/archive/refs/heads/main.tar.gz | tar -xz -C "$tmp_dir/ssh6-installer" --strip-components=1
+    else
+      echo "Neither git nor curl found to download ssh6-installer." >&2
+      rm -rf "$tmp_dir"
+      exit 1
+    fi
+
+    if [[ -f "$tmp_dir/ssh6-installer/install.sh" ]]; then
+      bash "$tmp_dir/ssh6-installer/install.sh" || sudo bash "$tmp_dir/ssh6-installer/install.sh"
+    elif [[ -f "$tmp_dir/ssh6-installer/setup.sh" ]]; then
+      bash "$tmp_dir/ssh6-installer/setup.sh" || sudo bash "$tmp_dir/ssh6-installer/setup.sh"
+    fi
+    rm -rf "$tmp_dir"
+  fi
+}
+
+auto_install_deps() {
+  local missing=()
+  command -v fzf >/dev/null 2>&1 || missing+=("fzf")
+  command -v sshpass >/dev/null 2>&1 || missing+=("sshpass")
+  command -v gpg >/dev/null 2>&1 || missing+=("gnupg")
+  command -v whiptail >/dev/null 2>&1 || missing+=("whiptail")
+  command -v secret-tool >/dev/null 2>&1 || missing+=("libsecret-tools")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Auto-installing missing dependencies: ${missing[*]}..."
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -qq && sudo apt-get install -y "${missing[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y "${missing[@]}"
+    elif command -v pacman >/dev/null 2>&1; then
+      sudo pacman -Sy --noconfirm "${missing[@]}"
+    else
+      echo "Package manager not supported automatically. Please install: ${missing[*]}" >&2
+      exit 1
+    fi
+  fi
+
+  # Ensure ssh6 is available for legacy devices
+  ensure_ssh6
+}
+
+if ! command -v whiptail >/dev/null 2>&1; then
+  if command -v dialog >/dev/null 2>&1; then
+    UI="dialog"
+  fi
+fi
+
+# Auto-install all dependencies on first run
+auto_install_deps
+
+# ---------- SSH Legacy Detector & Execution ----------
+
+exec_ssh_auto() {
+  local host="$1" port="$2" user="$3" pass="${4:-}" key="${5:-}" legacy="${6:-no}"
+
+  local ssh_opts=(-p "$port")
+  [[ -n "$key" ]] && ssh_opts+=(-i "${key/#\~/$HOME}")
+
+  local CMD="ssh"
+  local use_legacy_flags=false
+  local legacy_opts=()
+
+  # Legacy algorithms for old devices (ssh-dss, ssh-rsa removed in OpenSSH 7+)
+  legacy_opts=(
+    -o KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1
+    -o HostKeyAlgorithms=+ssh-dss,ssh-rsa
+    -o PubkeyAcceptedKeyTypes=+ssh-dss,ssh-rsa
+    -o Ciphers=+aes128-cbc,3des-cbc,aes192-cbc,aes256-cbc
+    -o MACs=+hmac-md5,hmac-sha1,hmac-sha1-96
+  )
+
+  # If bookmark is marked as legacy-only, skip probing and use ssh6 directly
+  if [[ "$legacy" == "yes" ]]; then
+    echo "[*] Bookmark marked as legacy-only. Using ssh6 directly..."
+    ensure_ssh6
+    CMD="ssh6"
+  else
+    # 1. Probe with modern SSH client
+    local probe_err
+    probe_err=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "${ssh_opts[@]}" "$user@$host" exit 2>&1 || true)
+
+    if echo "$probe_err" | grep -qE "no matching (host key|cipher|key exchange|MAC) (type|method) found"; then
+      echo "[!] Legacy crypto detected on $host. Negotiating algorithms..."
+
+      # 2. Probe modern SSH with legacy options appended
+      local legacy_probe
+      legacy_probe=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "${ssh_opts[@]}" "${legacy_opts[@]}" "$user@$host" exit 2>&1 || true)
+
+      # Check if modern SSH rejects the legacy algorithms entirely (e.g., OpenSSH 9.8 dropped dss completely)
+      if echo "$legacy_probe" | grep -qiE "unsupported option|bad ssh2|bad configuration|no matching|unknown option|bad (key types|protocol|cipher)"; then
+         echo "[!] Modern SSH client lacks binary support for these algorithms. Switching to ssh6..."
+         ensure_ssh6
+         CMD="ssh6"
+      else
+         echo "[*] Modern SSH supports the legacy options natively."
+         use_legacy_flags=true
+      fi
+    fi
+  fi
+
+  # 3. Apply configurations and Execute
+  if [[ "$CMD" == "ssh6" ]]; then
+      # Setup isolated config to bypass ssh6 crashing on "Include" directives
+      if [[ ! -f "$SSH6_CONF" ]]; then
+        echo "StrictHostKeyChecking no" > "$SSH6_CONF"
+        echo "UserKnownHostsFile /dev/null" >> "$SSH6_CONF"
+      fi
+      
+      # Log config logic for tracking
+      if ! grep -q "Host $host" "$SSH6_CONF" 2>/dev/null; then
+        {
+          echo ""
+          echo "Host $host"
+          echo "  KexAlgorithms diffie-hellman-group1-sha1,diffie-hellman-group14-sha1"
+          echo "  HostKeyAlgorithms ssh-dss,ssh-rsa"
+          echo "  Ciphers aes128-cbc,3des-cbc,aes192-cbc,aes256-cbc"
+        } >> "$SSH6_CONF"
+      fi
+      
+      # Use the isolated config file
+      ssh_opts=("-F" "$SSH6_CONF" "${ssh_opts[@]}")
+
+      if [[ -n "$pass" ]]; then
+         auto_install_deps
+         sshpass -p "$pass" ssh6 "${ssh_opts[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no "$user@$host" || true
+      else
+         ssh6 "${ssh_opts[@]}" "$user@$host" || true
+      fi
+
+  else
+      # Handling standard modern SSH
+      if [[ "$use_legacy_flags" == true ]]; then
+         ssh_opts=("${ssh_opts[@]}" "${legacy_opts[@]}")
+         
+         # Store the legacy algorithm options in standard ~/.ssh/config for native use later
+         mkdir -p ~/.ssh
+         touch ~/.ssh/config
+         if ! grep -q "Host $host" ~/.ssh/config; then
+            {
+              echo ""
+              echo "Host $host"
+              echo "  KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1"
+              echo "  HostKeyAlgorithms +ssh-dss,ssh-rsa"
+              echo "  PubkeyAcceptedKeyTypes +ssh-dss,ssh-rsa"
+              echo "  Ciphers +aes128-cbc,3des-cbc,aes256-cbc"
+              echo "  MACs +hmac-md5,hmac-sha1,hmac-sha1-96"
+            } >> ~/.ssh/config
+            echo "[*] Saved auto-negotiated legacy algorithm options to ~/.ssh/config for $host"
+         fi
+      fi
+
+      if [[ -n "$pass" ]]; then
+         auto_install_deps
+         sshpass -p "$pass" ssh "${ssh_opts[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no "$user@$host" || true
+      else
+         ssh "${ssh_opts[@]}" "$user@$host" || true
+      fi
+  fi
+}
+
+# ---------- Master Password / Crypto Helpers ----------
+
+# OS Keyring helpers (GNOME Keyring / KDE Wallet via libsecret)
+keyring_store() {
+  local key="$1" value="$2"
+  if command -v secret-tool >/dev/null 2>&1; then
+    printf '%s' "$value" | secret-tool store --label="sshb" "sshb" "$key" 2>/dev/null
+  elif command -v kwalletcli >/dev/null 2>&1; then
+    kwalletcli -f sshb -v "$key" -e "$value" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+keyring_lookup() {
+  local key="$1"
+  if command -v secret-tool >/dev/null 2>&1; then
+    secret-tool lookup "sshb" "$key" 2>/dev/null
+  elif command -v kwalletcli >/dev/null 2>&1; then
+    kwalletcli -f sshb -v "$key" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+keyring_delete() {
+  local key="$1"
+  if command -v secret-tool >/dev/null 2>&1; then
+    secret-tool clear "sshb" "$key" 2>/dev/null
+  elif command -v kwalletcli >/dev/null 2>&1; then
+    kwalletcli -f sshb -d "$key" 2>/dev/null
+  fi
+}
+
+save_cached_password() {
+  [[ -z "$MASTER_PASS" ]] && return
+  # Store with timestamp for TTL check
+  local payload="${MASTER_PASS}|$(date +%s)"
+  keyring_store "master_$USER" "$payload" 2>/dev/null || {
+    # Fallback: GPG-encrypted file
+    local enc_file="${CACHE_FILE}.enc"
+    printf '%s' "$payload" | \
+      gpg --batch --yes --pinentry-mode loopback \
+          --symmetric --cipher-algo AES256 \
+          --passphrase "$MASTER_PASS" -o "$enc_file" 2>/dev/null
+    chmod 600 "$enc_file" 2>/dev/null
+  }
+}
+
+load_cached_password() {
+  [[ -n "$MASTER_PASS" ]] && return 0
+
+  local payload=""
+  if keyring_lookup "master_$USER" >/dev/null 2>&1; then
+    payload=$(keyring_lookup "master_$USER")
+  elif [[ -f "${CACHE_FILE}.enc" ]]; then
+    # Can't decrypt without password - skip
+    return 1
+  fi
+
+  [[ -z "$payload" ]] && return 1
+
+  local cached_pass cached_ts
+  cached_pass="${payload%%|*}"
+  cached_ts="${payload##*|}"
+
+  local cache_age=$(( $(date +%s) - cached_ts ))
+  if (( cache_age > CACHE_TTL )); then
+    keyring_delete "master_$USER" 2>/dev/null
+    return 1
+  fi
+
+  MASTER_PASS="$cached_pass"
+  return 0
+}
+
+clear_cached_password() {
+  keyring_delete "master_$USER" 2>/dev/null
+  rm -f "${CACHE_FILE}.enc" 2>/dev/null
+  MASTER_PASS=""
+}
+
+read_master_password() {
+  [[ -n "$MASTER_PASS" ]] && return
+
+  # Try loading from OS keyring first
+  if load_cached_password; then
+    echo "[*] Master password loaded from OS keyring"
+    return 0
+  fi
+
+  auto_install_deps
+  read -rsp "Master password: " MASTER_PASS
+  echo
+  verify_master_password
+  save_cached_password
+}
+
+verify_master_password() {
+  if [[ ! -s "$VERIFIER_FILE" ]]; then
+    printf '%s' "sshb-verify-ok" | \
+      gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+          --symmetric --cipher-algo AES256 -o - 3<<< "$MASTER_PASS" 2>/dev/null | \
+      base64 -w0 > "$VERIFIER_FILE"
+    chmod 600 "$VERIFIER_FILE"
+    echo "(Master password set for the first time -- remember it, it's not recoverable.)"
+  else
+    local check
+    check=$(base64 -d < "$VERIFIER_FILE" 2>/dev/null | \
+      gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+          --decrypt -o - 3<<< "$MASTER_PASS" 2>/dev/null || true)
+    if [[ "$check" != "sshb-verify-ok" ]]; then
+      echo "Incorrect master password." >&2
+      exit 1
+    fi
+  fi
+}
+
+encrypt_secret() {
+  printf '%s' "$1" | \
+    gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+        --symmetric --cipher-algo AES256 -o - 3<<< "$MASTER_PASS" 2>/dev/null | \
+    base64 -w0
+}
+
+decrypt_secret() {
+  printf '%s' "$1" | base64 -d 2>/dev/null | \
+    gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+        --decrypt -o - 3<<< "$MASTER_PASS" 2>/dev/null
+}
+
+# ---------- Storage Helpers ----------
+
+get_line_by_name() {
+  local name="$1"
+  grep -vE '^\s*#|^\s*$' "$CONF_FILE" | awk -F'|' -v n="$name" '$2==n {print; exit}'
+}
+
+name_exists() {
+  [[ -n "$(get_line_by_name "$1")" ]]
+}
+
+# ---------- CLI Commands ----------
+
+cmd_add() {
+  local group name host port user auth secret legacy line
+
+  read -rp "Group (e.g. Nokia-OLT, Core-Routers): " group
+  read -rp "Bookmark name: " name
+  if name_exists "$name"; then
+    echo "A bookmark named '$name' already exists. Use 'sshb edit $name' instead." >&2
+    exit 1
+  fi
+  read -rp "Host/IP: " host
+  read -rp "Port [22]: " port
+  port="${port:-22}"
+  read -rp "User: " user
+  read -rp "Auth type (key/pass/ask) [ask]: " auth
+  auth="${auth:-ask}"
+  read -rp "Legacy-only device, requires ssh6? (yes/no) [no]: " legacy
+  legacy="${legacy:-no}"
+
+  case "$auth" in
+    key)
+      read -rp "Private key path (blank = default key): " secret
+      ;;
+    pass)
+      read_master_password
+      local plain
+      read -rsp "Password: " plain
+      echo
+      secret="$(encrypt_secret "$plain")"
+      unset plain
+      ;;
+    ask)
+      secret=""
+      ;;
+    *)
+      echo "Invalid auth type: $auth (use key/pass/ask)" >&2
+      exit 1
+      ;;
+  esac
+
+  line="${group}|${name}|${host}|${port}|${user}|${auth}|${secret}|${legacy}"
+  echo "$line" >> "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  echo "Added '$name' to group '$group'."
+}
+
+cmd_edit() {
+  local name="$1"
+  local line group host port user auth secret legacy
+  line="$(get_line_by_name "$name")"
+  if [[ -z "$line" ]]; then
+    echo "No bookmark named '$name'." >&2
+    exit 1
+  fi
+  IFS='|' read -r group _ host port user auth secret legacy <<< "$line"
+  legacy="${legacy:-no}"
+
+  echo "Editing '$name' (press Enter to keep current value)"
+  local new
+  read -rp "Group [$group]: " new; group="${new:-$group}"
+  read -rp "Host [$host]: " new; host="${new:-$host}"
+  read -rp "Port [$port]: " new; port="${new:-$port}"
+  read -rp "User [$user]: " new; user="${new:-$user}"
+  read -rp "Auth type (key/pass/ask) [$auth]: " new; auth="${new:-$auth}"
+  read -rp "Legacy-only, requires ssh6? (yes/no) [$legacy]: " new; legacy="${new:-$legacy}"
+
+  case "$auth" in
+    key)
+      read -rp "Private key path [keep current]: " new
+      [[ -n "$new" ]] && secret="$new"
+      ;;
+    pass)
+      read_master_password
+      local plain
+      read -rsp "New password (blank = keep current): " plain
+      echo
+      if [[ -n "$plain" ]]; then
+        secret="$(encrypt_secret "$plain")"
+      fi
+      unset plain
+      ;;
+    ask)
+      secret=""
+      ;;
+    *)
+      echo "Invalid auth type: $auth" >&2
+      exit 1
+      ;;
+  esac
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v n="$name" -v newline="${group}|${name}|${host}|${port}|${user}|${auth}|${secret}|${legacy}" \
+    'BEGIN{OFS="|"} $2==n {print newline; next} {print}' "$CONF_FILE" > "$tmp"
+  mv "$tmp" "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  echo "Updated '$name'."
+}
+
+cmd_del() {
+  local name="$1"
+  if ! name_exists "$name"; then
+    echo "No bookmark named '$name'." >&2
+    exit 1
+  fi
+  read -rp "Delete '$name'? [y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v n="$name" '$2!=n' "$CONF_FILE" > "$tmp"
+  mv "$tmp" "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  echo "Deleted '$name'."
+}
+
+cmd_list() {
+  grep -vE '^\s*#|^\s*$' "$CONF_FILE" | \
+    awk -F'|' '{legacy=($8=="yes"?" [LEGACY]":""); printf "[%s] %-20s %s@%s:%s  (auth: %s)%s\n", $1, $2, $5, $3, $4, $6, legacy}' | sort
+}
+
+cmd_search() {
+  need fzf
+  mapfile -t LINES < <(grep -vE '^\s*#|^\s*$' "$CONF_FILE")
+  if [[ ${#LINES[@]} -eq 0 ]]; then
+    echo "No bookmarks yet. Add one with: sshb add" >&2
+    exit 1
+  fi
+
+  declare -A LINE_MAP
+  local DISPLAY_LINES=()
+  local line group name host port user auth secret legacy
+  for line in "${LINES[@]}"; do
+    IFS='|' read -r group name host port user auth secret legacy <<< "$line"
+    legacy="${legacy:-no}"
+    local tag=""
+    [[ "$legacy" == "yes" ]] && tag=" [LEGACY]"
+    local label="[$group] $name  $user@$host:$port  (auth: $auth)${tag}"
+    DISPLAY_LINES+=("$label")
+    LINE_MAP["$label"]="$line"
+  done
+
+  local PREVIEW_CMD='echo "Group: {1}" | tr -d "[]"; echo "Name: {2}"; echo "{3}" | awk -F@ "{print \"User: \" \$1}"; echo "{3}" | awk -F: "{print \"Host: \" \$1; print \"Port: \" \$2}"; echo "Auth: {5}" | tr -d ")"; echo "{6}" | tr -d "[]"'
+
+  local result_file
+  result_file=$(mktemp)
+
+  printf '%s\n' "${DISPLAY_LINES[@]}" | sort | \
+    fzf --height=100% --border --prompt="search> " \
+        --header="Type to search | Enter: connect | Ctrl-E: edit | Ctrl-D: delete" \
+        --preview="$PREVIEW_CMD" \
+        --preview-window=right:30%:wrap \
+        --expect=ctrl-e \
+        --expect=ctrl-d > "$result_file" 2>/dev/null
+
+  local key_pressed selected_label
+  key_pressed=$(head -1 "$result_file")
+  selected_label=$(sed -n '2p' "$result_file")
+  rm -f "$result_file"
+
+  [[ -z "${selected_label:-}" ]] && exit 0
+
+  local raw_line="${LINE_MAP[$selected_label]}"
+  [[ -z "$raw_line" ]] && exit 0
+
+  local action="connect"
+  [[ "$key_pressed" == "ctrl-e" ]] && action="edit"
+  [[ "$key_pressed" == "ctrl-d" ]] && action="delete"
+
+  IFS='|' read -r group name host port user auth secret legacy <<< "$raw_line"
+  legacy="${legacy:-no}"
+
+  case "$action" in
+    connect)
+      echo "Connecting to $name ($host) as $user via $auth..."
+      case "$auth" in
+        key) exec_ssh_auto "$host" "$port" "$user" "" "$secret" "$legacy" ;;
+        pass)
+          read_master_password
+          local plain
+          plain="$(decrypt_secret "$secret")"
+          [[ -z "$plain" ]] && { echo "Failed to decrypt password." >&2; exit 1; }
+          exec_ssh_auto "$host" "$port" "$user" "$plain" "" "$legacy"
+          unset plain
+          ;;
+        ask) exec_ssh_auto "$host" "$port" "$user" "" "" "$legacy" ;;
+      esac
+      ;;
+    edit)
+      cmd_edit "$name"
+      ;;
+    delete)
+      read -rp "Delete '$name'? [y/N]: " confirm
+      [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
+      local tmp
+      tmp="$(mktemp)"
+      awk -F'|' -v n="$name" '$2!=n' "$CONF_FILE" > "$tmp"
+      mv "$tmp" "$CONF_FILE"
+      chmod 600 "$CONF_FILE"
+      echo "Deleted '$name'."
+      ;;
+  esac
+}
+
+cmd_connect() {
+  need fzf
+  mapfile -t LINES < <(grep -vE '^\s*#|^\s*$' "$CONF_FILE")
+  if [[ ${#LINES[@]} -eq 0 ]]; then
+    echo "No bookmarks yet. Add one with: sshb add" >&2
+    exit 1
+  fi
+
+  declare -A ROW_MAP
+  DISPLAY_LIST=()
+  for line in "${LINES[@]}"; do
+    IFS='|' read -r group name host port user auth secret legacy <<< "$line"
+    legacy="${legacy:-no}"
+    tag=""
+    [[ "$legacy" == "yes" ]] && tag=" [LEGACY]"
+    label="[$group] $name  ->  $user@$host:$port${tag}"
+    DISPLAY_LIST+=("$label")
+    ROW_MAP["$label"]="$line"
+  done
+
+  local selected
+  selected=$(printf '%s\n' "${DISPLAY_LIST[@]}" | sort | \
+    fzf --height=100% --border --prompt="ssh> " \
+        --header="Enter: connect | Ctrl-C: quit")
+  [[ -z "${selected:-}" ]] && exit 0
+
+  local group name host port user auth secret legacy
+  IFS='|' read -r group name host port user auth secret legacy <<< "${ROW_MAP[$selected]}"
+  legacy="${legacy:-no}"
+
+  echo "Connecting to $name ($host) as $user via $auth..."
+  case "$auth" in
+    key)
+      exec_ssh_auto "$host" "$port" "$user" "" "$secret" "$legacy"
+      ;;
+    pass)
+      read_master_password
+      local plain
+      plain="$(decrypt_secret "$secret")"
+      if [[ -z "$plain" ]]; then
+        echo "Failed to decrypt password (wrong master password?)." >&2
+        exit 1
+      fi
+      exec_ssh_auto "$host" "$port" "$user" "$plain" "" "$legacy"
+      unset plain
+      ;;
+    ask)
+      exec_ssh_auto "$host" "$port" "$user" "" "" "$legacy"
+      ;;
+    *)
+      echo "Unknown auth type: $auth" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# ---------- TUI Interface ----------
+
+BOX_H=20
+BOX_W=76
+LIST_H=12
+
+tui_check() {
+  if [[ "$UI" != "whiptail" && "$UI" != "dialog" ]]; then
+    echo "Neither whiptail nor dialog is installed." >&2
+    echo "Install with: sudo apt install whiptail   (or) sudo apt install dialog" >&2
+    exit 1
+  fi
+}
+
+read_master_password_tui() {
+  [[ -n "$MASTER_PASS" ]] && return 0
+
+  # Try loading from OS keyring first
+  if load_cached_password; then
+    return 0
+  fi
+
+  auto_install_deps
+  local pw
+  pw=$("$UI" --passwordbox "Master password:" 10 60 3>&1 1>&2 2>&3) || return 1
+  MASTER_PASS="$pw"
+  if [[ ! -s "$VERIFIER_FILE" ]]; then
+    verify_master_password
+  else
+    local check
+    check=$(base64 -d < "$VERIFIER_FILE" 2>/dev/null | \
+      gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+          --decrypt -o - 3<<< "$MASTER_PASS" 2>/dev/null || true)
+    if [[ "$check" != "sshb-verify-ok" ]]; then
+      "$UI" --msgbox "Incorrect master password." 8 50
+      MASTER_PASS=""
+      return 1
+    fi
+  fi
+  save_cached_password
+  return 0
+}
+
+tui_pick_bookmark() {
+  local title="$1"
+  mapfile -t LINES < <(grep -vE '^\s*#|^\s*$' "$CONF_FILE")
+  if [[ ${#LINES[@]} -eq 0 ]]; then
+    "$UI" --msgbox "No bookmarks yet. Use 'Add bookmark' first." 8 50
+    return 1
+  fi
+  local args=()
+  local line group name host port user auth secret
+  for line in "${LINES[@]}"; do
+    IFS='|' read -r group name host port user auth secret <<< "$line"
+    args+=("$name" "[$group] $user@$host:$port ($auth)")
+  done
+  local choice
+  choice=$("$UI" --menu "$title" "$BOX_H" "$BOX_W" "$LIST_H" "${args[@]}" 3>&1 1>&2 2>&3) || return 1
+  TUI_SELECTED_NAME="$choice"
+  return 0
+}
+
+tui_connect() {
+  tui_pick_bookmark "Select a host to connect" || return 0
+  local name="$TUI_SELECTED_NAME"
+  local line group host port user auth secret legacy
+  line="$(get_line_by_name "$name")"
+  IFS='|' read -r group _ host port user auth secret legacy <<< "$line"
+  legacy="${legacy:-no}"
+
+  case "$auth" in
+    key)
+      clear
+      echo "Connecting to $name ($host) as $user..."
+      exec_ssh_auto "$host" "$port" "$user" "" "$secret" "$legacy"
+      ;;
+    pass)
+      read_master_password_tui || return 0
+      local plain
+      plain="$(decrypt_secret "$secret")"
+      if [[ -z "$plain" ]]; then
+        "$UI" --msgbox "Failed to decrypt password (wrong master password?)." 8 60
+        return 0
+      fi
+      clear
+      echo "Connecting to $name ($host) as $user..."
+      exec_ssh_auto "$host" "$port" "$user" "$plain" "" "$legacy"
+      unset plain
+      ;;
+    ask)
+      clear
+      echo "Connecting to $name ($host) as $user..."
+      exec_ssh_auto "$host" "$port" "$user" "" "" "$legacy"
+      ;;
+  esac
+  echo
+  read -rp "Press Enter to return to menu..." _
+}
+
+tui_add() {
+  local group name host port user auth secret legacy
+  group=$("$UI" --inputbox "Group (e.g. Nokia-OLT, Core-Routers):" 10 60 3>&1 1>&2 2>&3) || return 0
+  name=$("$UI" --inputbox "Bookmark name:" 10 60 3>&1 1>&2 2>&3) || return 0
+  if [[ -z "$name" ]] || name_exists "$name"; then
+    "$UI" --msgbox "Name is empty or already exists." 8 50
+    return 0
+  fi
+  host=$("$UI" --inputbox "Host/IP:" 10 60 3>&1 1>&2 2>&3) || return 0
+  port=$("$UI" --inputbox "Port:" 10 60 "22" 3>&1 1>&2 2>&3) || return 0
+  user=$("$UI" --inputbox "User:" 10 60 3>&1 1>&2 2>&3) || return 0
+  auth=$("$UI" --menu "Auth type:" 14 60 3 \
+    "key"  "SSH private key" \
+    "pass" "Password (GPG encrypted)" \
+    "ask"  "Prompt each time" \
+    3>&1 1>&2 2>&3) || return 0
+  legacy=$("$UI" --menu "Legacy device (requires ssh6)?" 12 60 2 \
+    "no"  "Modern SSH compatible" \
+    "yes" "Old device, needs ssh6" \
+    3>&1 1>&2 2>&3) || return 0
+
+  case "$auth" in
+    key)
+      secret=$("$UI" --inputbox "Private key path (blank = default key):" 10 60 3>&1 1>&2 2>&3) || return 0
+      ;;
+    pass)
+      read_master_password_tui || return 0
+      local plain
+      plain=$("$UI" --passwordbox "Password:" 10 60 3>&1 1>&2 2>&3) || return 0
+      secret="$(encrypt_secret "$plain")"
+      unset plain
+      ;;
+    ask) secret="" ;;
+  esac
+
+  echo "${group}|${name}|${host}|${port}|${user}|${auth}|${secret}|${legacy}" >> "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  "$UI" --msgbox "Added '$name' to group '$group'." 8 50
+}
+
+tui_edit() {
+  tui_pick_bookmark "Select a bookmark to edit" || return 0
+  local name="$TUI_SELECTED_NAME"
+  local line group host port user auth secret legacy
+  line="$(get_line_by_name "$name")"
+  IFS='|' read -r group _ host port user auth secret legacy <<< "$line"
+  legacy="${legacy:-no}"
+
+  group=$("$UI" --inputbox "Group:" 10 60 "$group" 3>&1 1>&2 2>&3) || return 0
+  host=$("$UI" --inputbox "Host:" 10 60 "$host" 3>&1 1>&2 2>&3) || return 0
+  port=$("$UI" --inputbox "Port:" 10 60 "$port" 3>&1 1>&2 2>&3) || return 0
+  user=$("$UI" --inputbox "User:" 10 60 "$user" 3>&1 1>&2 2>&3) || return 0
+  auth=$("$UI" --menu "Auth type:" 14 60 3 \
+    "key"  "SSH private key" \
+    "pass" "Password (GPG encrypted)" \
+    "ask"  "Prompt each time" \
+    3>&1 1>&2 2>&3) || return 0
+  legacy=$("$UI" --menu "Legacy device (requires ssh6)?" 12 60 2 \
+    "no"  "Modern SSH compatible" \
+    "yes" "Old device, needs ssh6" \
+    3>&1 1>&2 2>&3) || return 0
+
+  case "$auth" in
+    key)
+      local newpath
+      newpath=$("$UI" --inputbox "Private key path (blank = keep current):" 10 60 3>&1 1>&2 2>&3) || return 0
+      [[ -n "$newpath" ]] && secret="$newpath"
+      ;;
+    pass)
+      read_master_password_tui || return 0
+      local plain
+      plain=$("$UI" --passwordbox "New password (blank = keep current):" 10 60 3>&1 1>&2 2>&3) || return 0
+      [[ -n "$plain" ]] && secret="$(encrypt_secret "$plain")"
+      unset plain
+      ;;
+    ask) secret="" ;;
+  esac
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v n="$name" -v newline="${group}|${name}|${host}|${port}|${user}|${auth}|${secret}|${legacy}" \
+    'BEGIN{OFS="|"} $2==n {print newline; next} {print}' "$CONF_FILE" > "$tmp"
+  mv "$tmp" "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  "$UI" --msgbox "Updated '$name'." 8 50
+}
+
+tui_delete() {
+  tui_pick_bookmark "Select a bookmark to delete" || return 0
+  local name="$TUI_SELECTED_NAME"
+  if "$UI" --yesno "Delete '$name'? This cannot be undone." 8 50; then
+    local tmp
+    tmp="$(mktemp)"
+    awk -F'|' -v n="$name" '$2!=n' "$CONF_FILE" > "$tmp"
+    mv "$tmp" "$CONF_FILE"
+    chmod 600 "$CONF_FILE"
+    "$UI" --msgbox "Deleted '$name'." 8 50
+  fi
+}
+
+tui_list() {
+  local tmp
+  tmp="$(mktemp)"
+  grep -vE '^\s*#|^\s*$' "$CONF_FILE" | \
+    awk -F'|' '{legacy=($8=="yes"?" [LEGACY]":""); printf "[%s] %-20s %s@%s:%s  (auth: %s)%s\n", $1, $2, $5, $3, $4, $6, legacy}' | sort > "$tmp"
+  [[ -s "$tmp" ]] || echo "(no bookmarks yet)" > "$tmp"
+  "$UI" --textbox "$tmp" "$BOX_H" "$BOX_W"
+  rm -f "$tmp"
+}
+
+tui_main() {
+  tui_check
+  while true; do
+    CHOICE=$("$UI" --title "SSH Bookmark Manager" --menu "Choose an action" 18 60 8 \
+      "1" "Connect" \
+      "2" "Search (fzf)" \
+      "3" "Add bookmark" \
+      "4" "Edit bookmark" \
+      "5" "Delete bookmark" \
+      "6" "List all" \
+      "7" "Logout (clear cache)" \
+      "8" "Quit" \
+      3>&1 1>&2 2>&3) || break
+    case "$CHOICE" in
+      1) tui_connect ;;
+      2) cmd_search ;;
+      3) tui_add ;;
+      4) tui_edit ;;
+      5) tui_delete ;;
+      6) tui_list ;;
+      7) clear_cached_password; "$UI" --msgbox "Master password cache cleared." 8 50 ;;
+      8) break ;;
+    esac
+  done
+  clear
+}
+
+# ---------- Dispatch ----------
+
+case "${1:-}" in
+  add)     cmd_add ;;
+  edit)    [[ -n "${2:-}" ]] || { echo "Usage: sshb edit <name>" >&2; exit 1; }; cmd_edit "$2" ;;
+  del)     [[ -n "${2:-}" ]] || { echo "Usage: sshb del <name>" >&2; exit 1; }; cmd_del "$2" ;;
+  list)    cmd_list ;;
+  search|fzf|s) cmd_search ;;
+  connect) cmd_connect ;;
+  logout|clear-cache) clear_cached_password; echo "Master password cache cleared." ;;
+  ""|tui)  tui_main ;;
+  *)
+    echo "Usage: sshb [tui|connect|search|add|edit <name>|del <name>|list|logout]" >&2
+    echo "  (no args)  -> whiptail/dialog TUI (default)" >&2
+    echo "  connect    -> fzf-based picker" >&2
+    echo "  search     -> smart search with preview (fzf)" >&2
+    echo "  logout     -> clear cached master password" >&2
+    exit 1
+    ;;
+esac
